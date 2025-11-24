@@ -25,6 +25,7 @@ WINBASEAPI int WINAPI KERNEL32$MultiByteToWideChar (UINT CodePage, DWORD dwFlags
 WINBASEAPI DWORD WINAPI KERNEL32$GetFileAttributesW (LPCWSTR lpFileName);
 WINBASEAPI WINBOOL WINAPI KERNEL32$CreateDirectoryW (LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes);
 WINBASEAPI int WINAPI KERNEL32$lstrlenW (LPCWSTR lpString);
+WINBASEAPI WINBOOL WINAPI KERNEL32$GetComputerNameA (LPSTR lpBuffer, LPDWORD nSize);
 
 #define intAlloc(size) KERNEL32$HeapAlloc(KERNEL32$GetProcessHeap(), HEAP_ZERO_MEMORY, size)
 #define intFree(addr) KERNEL32$HeapFree(KERNEL32$GetProcessHeap(), 0, addr)
@@ -39,6 +40,7 @@ WINBASEAPI int __cdecl MSVCRT$vsnprintf(char * __restrict__ d,size_t n,const cha
 WINBASEAPI size_t __cdecl MSVCRT$strlen(const char *_Str);
 DECLSPEC_IMPORT int __cdecl MSVCRT$strcmp(const char *_Str1,const char *_Str2);
 DECLSPEC_IMPORT char * __cdecl MSVCRT$strcpy(char * __restrict__ __dst, const char * __restrict__ __src);
+DECLSPEC_IMPORT char * __cdecl MSVCRT$strrchr(const char *_Str, int _Ch);
 WINBASEAPI void *__cdecl MSVCRT$calloc(size_t _NumOfElements, size_t _SizeOfElements);
 WINBASEAPI void __cdecl MSVCRT$free(void *_Memory);
 
