@@ -85,6 +85,34 @@ typedef struct {
     DWORD residentDataSize;
 } FILE_INFO;
 
+// Constants
+#ifndef MAX_COMPUTERNAME_LENGTH
+#define MAX_COMPUTERNAME_LENGTH 15
+#endif
+
+// FSCTL_GET_RETRIEVAL_POINTERS constants
+#ifndef FSCTL_GET_RETRIEVAL_POINTERS
+#define FSCTL_GET_RETRIEVAL_POINTERS 0x00090073
+#endif
+
+#ifndef ERROR_MORE_DATA
+#define ERROR_MORE_DATA 234
+#endif
+
+// Structures for FSCTL_GET_RETRIEVAL_POINTERS
+typedef struct {
+    LARGE_INTEGER StartingVcn;
+} STARTING_VCN_INPUT_BUFFER;
+
+typedef struct {
+    DWORD ExtentCount;
+    LARGE_INTEGER StartingVcn;
+    struct {
+        LARGE_INTEGER NextVcn;
+        LARGE_INTEGER Lcn;
+    } Extents[1];
+} RETRIEVAL_POINTERS_BUFFER, *PRETRIEVAL_POINTERS_BUFFER;
+
 // Function declarations
 BOOL ReadNtfsBoot(HANDLE hVolume, NTFS_BOOT* boot);
 BOOL GetNtfsFileInfo(LPCWSTR filePath, ULONGLONG* mftRecordNumber, ULONGLONG* fileSize);

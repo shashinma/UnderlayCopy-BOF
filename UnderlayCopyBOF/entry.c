@@ -5,10 +5,6 @@
 #include "../_include/adaptix.h"
 #include "underlaycopy.h"
 
-#ifndef MAX_COMPUTERNAME_LENGTH
-#define MAX_COMPUTERNAME_LENGTH 15
-#endif
-
 // Helper function to read NTFS boot sector (stealth mode - no logging)
 BOOL ReadNtfsBoot(HANDLE hVolume, NTFS_BOOT* boot) {
     BYTE buffer[512];
@@ -394,15 +390,6 @@ BOOL CopyFileByMft(HANDLE hVolume, HANDLE hOutput, FILE_INFO* fileInfo, NTFS_BOO
     
     return TRUE;
 }
-
-// Structures for FSCTL_GET_RETRIEVAL_POINTERS are defined in winioctl.h
-#ifndef FSCTL_GET_RETRIEVAL_POINTERS
-#define FSCTL_GET_RETRIEVAL_POINTERS 0x00090073
-#endif
-
-#ifndef ERROR_MORE_DATA
-#define ERROR_MORE_DATA 234
-#endif
 
 // Get file extents using FSCTL_GET_RETRIEVAL_POINTERS (Metadata mode)
 int GetFileExtents(HANDLE hFile, EXTENT** extents, DWORD* extentCount) {
