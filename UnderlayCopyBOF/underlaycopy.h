@@ -99,19 +99,20 @@ typedef struct {
 #define ERROR_MORE_DATA 234
 #endif
 
-// Structures for FSCTL_GET_RETRIEVAL_POINTERS
-typedef struct {
-    LARGE_INTEGER StartingVcn;
-} STARTING_VCN_INPUT_BUFFER;
+// Structures for FSCTL_GET_RETRIEVAL_POINTERS are defined in winioctl.h
+// STARTING_VCN_INPUT_BUFFER and RETRIEVAL_POINTERS_BUFFER are already defined there
 
-typedef struct {
-    DWORD ExtentCount;
-    LARGE_INTEGER StartingVcn;
-    struct {
-        LARGE_INTEGER NextVcn;
-        LARGE_INTEGER Lcn;
-    } Extents[1];
-} RETRIEVAL_POINTERS_BUFFER, *PRETRIEVAL_POINTERS_BUFFER;
+// Helper function declarations
+BOOL NormalizePathForCreateFileW(LPCWSTR path, WCHAR* normalizedPath, int bufferSize);
+BOOL NormalizePathForNtCreateFile(LPCWSTR path, WCHAR* normalizedPath, int bufferSize);
+BOOL CreateOutputFileNt(LPCWSTR destPath, HANDLE* hOutput);
+BOOL CopyFileByExtentsToMemory(HANDLE hVolume, EXTENT* extents, DWORD extentCount, ULONGLONG clusterSize, ULONGLONG fileSize, BYTE** outputBuffer, ULONGLONG* outputSize);
+
+// Common I/O functions
+BOOL WriteSparseToFile(HANDLE hOutput, ULONGLONG offset, ULONGLONG size, BYTE* tempBuffer);
+void WriteSparseToMemory(BYTE* destBuffer, ULONGLONG offset, ULONGLONG size);
+BOOL CopyChunkToFile(HANDLE hVolume, HANDLE hOutput, ULONGLONG diskOffset, ULONGLONG toCopy, ULONGLONG writeOffset, BYTE* buffer, DWORD bufferSize, ULONGLONG* bytesWritten);
+BOOL CopyChunkToMemory(HANDLE hVolume, BYTE* destBuffer, ULONGLONG destOffset, ULONGLONG diskOffset, ULONGLONG toCopy, BYTE* readBuffer, DWORD bufferSize, ULONGLONG* bytesCopied);
 
 // Function declarations
 BOOL ReadNtfsBoot(HANDLE hVolume, NTFS_BOOT* boot);
