@@ -36,6 +36,9 @@
 #ifndef FILE_NON_DIRECTORY_FILE
 #define FILE_NON_DIRECTORY_FILE 0x00000040
 #endif
+#ifndef FILE_OPEN_FOR_BACKUP_INTENT
+#define FILE_OPEN_FOR_BACKUP_INTENT 0x00004000
+#endif
 #ifndef OBJ_CASE_INSENSITIVE
 #define OBJ_CASE_INSENSITIVE 0x00000040L
 #endif
@@ -55,6 +58,12 @@ typedef struct {
     ULONGLONG lcn;
     ULONGLONG length;
 } DATA_RUN;
+
+// Extent structure (for Metadata mode)
+typedef struct {
+    ULONGLONG lcn;
+    ULONGLONG lengthClusters;
+} EXTENT;
 
 // NTFS Boot Sector structure
 typedef struct {
@@ -83,6 +92,8 @@ BOOL ReadMftRecord(HANDLE hVolume, NTFS_BOOT* boot, ULONGLONG recordNumber, BYTE
 int ParseDataRuns(BYTE* dataRuns, int dataRunsSize, DATA_RUN** runs, NTFS_BOOT* boot);
 BOOL GetFileInfoFromRecord(BYTE* record, FILE_INFO* fileInfo, NTFS_BOOT* boot);
 BOOL CopyFileByMft(HANDLE hVolume, HANDLE hOutput, FILE_INFO* fileInfo, NTFS_BOOT* boot);
+int GetFileExtents(HANDLE hFile, EXTENT** extents, DWORD* extentCount);
+BOOL CopyFileByExtents(HANDLE hVolume, HANDLE hOutput, EXTENT* extents, DWORD extentCount, ULONGLONG clusterSize, ULONGLONG fileSize);
 
 #endif // UNDERLAYCOPY_H
 
