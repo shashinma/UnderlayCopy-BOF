@@ -34,10 +34,7 @@ cmd_underlaycopy.setPreHook(function (id, cmdline, parsed_json, ...parsed_lines)
     // Always pass destination (empty string if not provided)
     // The order matters: mode, source, dest, download
     let bof_params = ax.bof_pack("cstr,cstr,cstr,int", [mode, source, dest || "", download]);
-    // Map architecture: x32 -> x86, x64 -> x64
-    let arch = ax.arch(id);
-    let arch_suffix = (arch === "x32") ? "x86" : arch;
-    let bof_path = ax.script_dir() + "_bin/underlaycopy." + arch_suffix + ".o";
+    let bof_path = ax.script_dir() + "_bin/underlaycopy.x64.o";
 
     let cmd = "execute bof";
     if (ax.agent_info(id, "type") == "kharon") { cmd = "exec-bof"; }
