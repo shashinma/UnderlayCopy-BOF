@@ -62,7 +62,7 @@ underlaycopy MFT C:\Windows\System32\config\SYSTEM --download -w SYSTEM_backup
   - May fail on locked files that cannot be opened
 
 - **Volume Access**:
-  - Opens volume using NtCreateFile with \??\C: path
+  - Opens volume using NtCreateFile with `\??\C:` path
   - Reads directly from disk sectors using NtReadFile
   - Bypasses file system locks and access checks
 
